@@ -459,6 +459,21 @@ func (cli *Client) EncryptEventResponse(ctx context.Context, eventInfo *types.Me
 	}, nil
 }
 
+// BuildEvent wraps a pre-populated EventMessage in a creation message ready to
+// send with Client.SendMessage. Like a poll, an event must carry a fresh 32-byte
+// message secret in MessageContextInfo: recipients encrypt their RSVPs against it
+// (see BuildEventResponse), and whatsmeow stores it automatically on send, so
+// without it the event is malformed. The caller fills in the EventMessage fields
+// (name, start/end time, location, join link, etc.).
+func (cli *Client) BuildEvent(event *waE2E.EventMessage) *waE2E.Message {
+	return &waE2E.Message{
+		EventMessage: event,
+		MessageContextInfo: &waE2E.MessageContextInfo{
+			MessageSecret: random.Bytes(32),
+		},
+	}
+}
+
 // BuildEventResponse builds an event response (RSVP) message replying to the
 // given event. The built message can be sent normally using Client.SendMessage.
 //
