@@ -67,6 +67,23 @@ func (cli *Client) handleEncryptedMessage(ctx context.Context, node *waBinary.No
 	}
 }
 
+func (cli *Client) handleUnencryptedMessage(ctx context.Context, node *waBinary.Node) {
+	info, err := cli.parseMessageInfo(node)
+	if err != nil {
+		cli.Log.Warnf("Failed to parse message: %v", err)
+		cli.sendAck(ctx, node, NackParsingError)
+		return
+	}
+	if info.Sender.Server != types.NewsletterServer {
+		cli.sendAck(ctx, node, 0)
+		return
+	}
+	info.IsNewsletterStatus = true
+	var cancelled bool
+	defer cli.maybeDeferredAck(ctx, node)(&cancelled)
+	cancelled = cli.handlePlaintextMessage(ctx, info, node)
+}
+
 func (cli *Client) parseMessageSource(node *waBinary.Node, requireParticipant bool) (source types.MessageSource, err error) {
 	clientID := cli.getOwnID()
 	clientLID := cli.getOwnLID()
@@ -85,9 +102,8 @@ func (cli *Client) parseMessageSource(node *waBinary.Node, requireParticipant bo
 		} else {
 			source.Sender = ag.OptionalJIDOrEmpty("participant")
 		}
-		if source.AddressingMode == types.AddressingModeLID {
-			source.SenderAlt = ag.OptionalJIDOrEmpty("participant_pn")
-		} else {
+		source.SenderAlt = ag.OptionalJIDOrEmpty("participant_pn")
+		if source.SenderAlt.IsEmpty() && source.AddressingMode != types.AddressingModeLID {
 			source.SenderAlt = ag.OptionalJIDOrEmpty("participant_lid")
 		}
 		if source.Sender.User == clientID.User || source.Sender.User == clientLID.User {
@@ -177,11 +193,12 @@ func (cli *Client) parseMsgBotInfo(node waBinary.Node) (botInfo types.MsgBotInfo
 	botNode := node.GetChildByTag("bot")
 
 	ag := botNode.AttrGetter()
-	botInfo.EditType = types.BotEditType(ag.String("edit"))
-	if botInfo.EditType == types.EditTypeInner || botInfo.EditType == types.EditTypeLast {
-		botInfo.EditTargetID = types.MessageID(ag.String("edit_target_id"))
+	botInfo.EditType = types.BotEditType(ag.OptionalString("edit"))
+	if botInfo.EditType == types.EditTypeInner || botInfo.EditType == types.EditTypeLast || botInfo.EditType == types.EditTypeFull {
+		botInfo.EditTargetID = types.MessageID(ag.OptionalString("edit_target_id"))
 		botInfo.EditSenderTimestampMS = ag.UnixMilli("sender_timestamp_ms")
 	}
+	botInfo.ClientThreadID = ag.OptionalString("client_thread_id")
 	err = ag.Error()
 	return
 }
@@ -218,8 +235,8 @@ func (cli *Client) parseMessageInfo(node *waBinary.Node) (*types.MessageInfo, er
 	info.Category = ag.OptionalString("category")
 	info.Type = ag.OptionalString("type")
 	info.Edit = types.EditAttribute(ag.OptionalString("edit"))
-	if !ag.OK() {
-		return nil, ag.Error()
+	if err = ag.Error(); err != nil {
+		return nil, err
 	}
 
 	for _, child := range node.GetChildren() {
@@ -361,11 +378,9 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 					targetSenderJID = cli.getOwnID()
 				}
 			}
-			var decryptMessageID string
-			if info.MsgBotInfo.EditType == types.EditTypeInner || info.MsgBotInfo.EditType == types.EditTypeLast {
+			decryptMessageID := info.ID
+			if (info.MsgBotInfo.EditType == types.EditTypeInner || info.MsgBotInfo.EditType == types.EditTypeLast) && info.MsgBotInfo.EditTargetID != "" {
 				decryptMessageID = info.MsgBotInfo.EditTargetID
-			} else {
-				decryptMessageID = info.ID
 			}
 			var msMsg waE2E.MessageSecretMessage
 			var messageSecret []byte
@@ -377,13 +392,19 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 				err = fmt.Errorf("failed to unmarshal MessageSecretMessage protobuf: %v", err)
 			} else {
 				decrypted, err = cli.decryptBotMessage(ctx, messageSecret, &msMsg, decryptMessageID, targetSenderJID, info)
+				if err != nil && decryptMessageID != info.ID {
+					decrypted, err = cli.decryptBotMessage(ctx, messageSecret, &msMsg, info.ID, targetSenderJID, info)
+					if err == nil {
+						cli.Log.Debugf("Decrypted bot message %s using own ID instead of edit target ID %s", info.ID, decryptMessageID)
+					}
+				}
 			}
 		} else {
 			cli.Log.Warnf("Unhandled encrypted message (type %s) from %s", encType, info.SourceString())
 			continue
 		}
 
-		if errors.Is(err, EventAlreadyProcessed) {
+		if errors.Is(err, ErrEventAlreadyProcessed) {
 			cli.Log.Debugf("Ignoring message %s from %s: %v", info.ID, info.SourceString(), err)
 			continue
 		} else if errors.Is(err, signalerror.ErrOldCounter) {
@@ -473,7 +494,6 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 			cli.sendMessageReceipt(ctx, info, node)
 		}
 	})
-	return
 }
 
 func (cli *Client) clearUntrustedIdentity(ctx context.Context, target types.JID) error {
@@ -489,7 +509,10 @@ func (cli *Client) clearUntrustedIdentity(ctx context.Context, target types.JID)
 	return nil
 }
 
-var EventAlreadyProcessed = errors.New("event was already processed")
+var ErrEventAlreadyProcessed = errors.New("event was already processed")
+
+// Deprecated: use ErrEventAlreadyProcessed
+var EventAlreadyProcessed = ErrEventAlreadyProcessed
 
 func (cli *Client) bufferedDecrypt(
 	ctx context.Context,
@@ -521,7 +544,7 @@ func (cli *Client) bufferedDecrypt(
 				Hex("ciphertext_hash", ciphertextHash[:]).
 				Time("insertion_time", buf.InsertTime).
 				Msg("Returning event already processed error")
-			err = fmt.Errorf("%w at %s", EventAlreadyProcessed, buf.InsertTime.String())
+			err = fmt.Errorf("%w at %s", ErrEventAlreadyProcessed, buf.InsertTime.String())
 			return
 		}
 		zerolog.Ctx(ctx).Debug().
@@ -696,7 +719,7 @@ func (cli *Client) handleHistorySyncNotificationLoop() {
 			if err != nil {
 				cli.Log.Errorf("Failed to download history sync: %v", err)
 			} else {
-				cli.dispatchEvent(&events.HistorySync{Data: blob})
+				cli.dispatchEvent(&events.HistorySync{Data: blob, Notification: notif})
 				err = cli.DeleteMedia(ctx, MediaHistory, notif.GetDirectPath(), notif.GetFileEncSHA256(), notif.GetEncHandle())
 				if err != nil {
 					cli.Log.Warnf("Failed to delete history sync media from server: %v", err)
@@ -735,7 +758,7 @@ func (cli *Client) SendHistorySyncServerErrorReceipt(ctx context.Context, msgID 
 		},
 	})
 	if err != nil {
-		return fmt.Errorf("Failed to send history sync server-error receipt: %w", err)
+		return fmt.Errorf("failed to send history sync server-error receipt: %w", err)
 	}
 	return nil
 }
@@ -775,6 +798,9 @@ func (cli *Client) DownloadHistorySync(ctx context.Context, notif *waE2E.History
 		}
 		if historySync.GlobalSettings != nil {
 			cli.storeGlobalSettings(ctx, historySync.GlobalSettings)
+		}
+		if historySync.CompanionMetaNonce != nil {
+			cli.storeCompanionMetaNonce(ctx, historySync.GetCompanionMetaNonce())
 		}
 	}
 	if synchronousStorage {
@@ -945,15 +971,20 @@ func (cli *Client) storeHistoricalMessageSecrets(ctx context.Context, conversati
 		if chatJID.IsEmpty() {
 			continue
 		}
-		var chatPN types.JID
-		if chatJID.Server == types.DefaultUserServer {
-			chatPN = chatJID
-		} else if chatJID.Server == types.HiddenUserServer {
-			chatPN, _ = cli.Store.LIDs.GetPNForLID(ctx, chatJID)
+		var userJID types.JID
+		if chatJID.Server == types.HiddenUserServer {
+			userJID = chatJID
+		} else if chatJID.Server == types.DefaultUserServer {
+			userJID, _ = cli.Store.LIDs.GetLIDForPN(ctx, chatJID)
+			if userJID.IsEmpty() {
+				// Privacy token queries will check both LIDs and phone numbers, so while we prefer storing with LIDs,
+				// it's still better to store with the phone number than not at all.
+				userJID = chatJID
+			}
 		}
-		if !chatPN.IsEmpty() && conv.GetTcToken() != nil {
+		if !userJID.IsEmpty() && conv.GetTcToken() != nil {
 			privacyTokens = append(privacyTokens, store.PrivacyToken{
-				User:            chatPN,
+				User:            userJID,
 				Token:           conv.GetTcToken(),
 				Timestamp:       time.Unix(int64(conv.GetTcTokenTimestamp()), 0),
 				SenderTimestamp: time.Unix(int64(conv.GetTcTokenSenderTimestamp()), 0),
@@ -1055,6 +1086,20 @@ func (cli *Client) storeGlobalSettings(ctx context.Context, settings *waHistoryS
 			zerolog.Ctx(ctx).Debug().
 				Int64("lid_migration_timestamp", cli.Store.LIDMigrationTimestamp).
 				Msg("Saved chat DB LID migration timestamp")
+		}
+	}
+}
+
+func (cli *Client) storeCompanionMetaNonce(ctx context.Context, nonce string) {
+	if nonce != "" && nonce != cli.Store.CompanionMetaNonce {
+		cli.Store.CompanionMetaNonce = nonce
+		err := cli.Store.Save(ctx)
+		if err != nil {
+			zerolog.Ctx(ctx).Err(err).
+				Msg("Failed to save companion meta nonce")
+		} else {
+			zerolog.Ctx(ctx).Debug().
+				Msg("Saved companion meta nonce")
 		}
 	}
 }
